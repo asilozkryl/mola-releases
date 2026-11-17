@@ -1,0 +1,230 @@
+# Mola'nın sürüm paketlerini derler ve bu depoda yayımlar. Kaynak kod bu depoda değildir: gizli
+# kaynak deposu salt okunur bir anahtarla (MOLA_DEPLOY_KEY) çekilir, verilen etiket derlenir.
+# Elle çalıştırılır: Actions → Sürüm → Run workflow → etiket (ör. v1.2.0).
+# Eylemler etiket yerine tam commit kimliğine sabitlenmiştir.
+name: Sürüm
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Kaynak deposundaki sürüm etiketi (ör. v1.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag }}
+  SOURCE_REPO: asilozkryl/mola
+  # gh komutları, çekilen kaynak deposunu değil bu depoyu hedefler.
+  GH_REPO: ${{ github.repository }}
+  # Opus'u Windows ve macOS'ta kaynaktan, durağan olarak derle: kullanıcının makinesinde
+  # libopus aranmasın. Paketle gelen Opus kaynağı eski bir CMake sürümü bildirdiği için
+  # yeni CMake'e en düşük ilke sürümünü açıkça veriyoruz.
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+
+jobs:
+  create-release:
+    name: Taslak sürüm
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.MOLA_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Etiket ile uygulama sürümü aynı mı?
+        run: |
+          app="v$(jq -r .version desktop/src-tauri/tauri.conf.json)"
+          server="v$(grep -m1 '^version' server/Cargo.toml | cut -d'"' -f2)"
+          if [ "$app" != "$TAG" ] || [ "$server" != "$TAG" ]; then
+            echo "::error::Etiket $TAG; masaüstü sürümü $app, sunucu sürümü $server. Önce sürüm numaralarını güncelle."
+            exit 1
+          fi
+
+      - name: Taslak sürümü oluştur
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # İş akışı yeniden çalıştırılırsa var olan sürüm kullanılır.
+          gh release view "$TAG" > /dev/null 2>&1 ||
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "Mola ${TAG#v}" --notes "Paketler derleniyor."
+          echo "id=$(gh release view "$TAG" --json databaseId -q .databaseId)" >> "$GITHUB_OUTPUT"
+
+  desktop:
+    name: Masaüstü (${{ matrix.name }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Eski bir Ubuntu'da derlemek, paketin daha eski dağıtımlarda da çalışmasını sağlar.
+          - { name: Linux, os: ubuntu-22.04 }
+          - { name: Windows, os: windows-latest }
+          - { name: macOS Apple Silicon, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.MOLA_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Sistem paketleri (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libasound2-dev libopus-dev libxdo-dev libssl-dev patchelf
+
+      - name: Opus'u durağan derle (Windows, macOS)
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          echo "LIBOPUS_STATIC=1" >> "$GITHUB_ENV"
+          echo "LIBOPUS_NO_PKG=1" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: desktop/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable dalı
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Arayüz bağımlılıkları
+        working-directory: desktop
+        run: pnpm install --frozen-lockfile
+
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          projectPath: desktop
+          # Paketler bu depodaki taslak sürüme yüklenir.
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          uploadUpdaterJson: false
+          uploadWorkflowArtifacts: true
+
+  server:
+    name: Sunucu (${{ matrix.name }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux, os: ubuntu-22.04, suffix: x86_64-linux, binary: mola-server }
+          - { name: Windows, os: windows-latest, suffix: x86_64-windows, binary: mola-server.exe }
+          - { name: macOS Apple Silicon, os: macos-latest, suffix: aarch64-macos, binary: mola-server }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.MOLA_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable dalı
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Derle
+        run: cargo build --release -p mola-server
+
+      # Tarayıcı arayüzü sunucu paketine girer; sunucu onu `web` klasöründen kendisi sunar.
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: desktop/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - name: Web arayüzünü derle
+        working-directory: desktop
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      # Yayımlanacak ikilinin kendisi sınanır; yalnızca derlenmiş olması yetmez.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Uçtan uca test (sürüm ikilisi)
+        run: |
+          export MOLA_DB="$RUNNER_TEMP/mola.db" MOLA_UPLOADS="$RUNNER_TEMP/uploads"
+          # Web arayüzünü sunma testi için küçük bir örnek klasör.
+          mkdir -p "$RUNNER_TEMP/web/assets"
+          echo '<!doctype html><title>Mola</title><div id=root></div>' > "$RUNNER_TEMP/web/index.html"
+          echo 'console.log(1)' > "$RUNNER_TEMP/web/assets/app-abc.js"
+          echo gizli > "$RUNNER_TEMP/web/.env"
+          export MOLA_WEB="$RUNNER_TEMP/web"
+          MOLA_ADDR=127.0.0.1:7899 MOLA_STT_URL=http://127.0.0.1:7832/v1/audio/transcriptions MOLA_STT_API_KEY=test-stt MOLA_HOOK_ALLOW=127.0.0.1:7830 MOLA_ADMINS=yonetici1 MOLA_PUSH_ALLOW=127.0.0.1:7829 MOLA_AI_API_KEY=test-anahtar MOLA_AI_URL=http://127.0.0.1:7828/v1/messages MOLA_GOOGLE_CLIENT_ID=test-istemci MOLA_GOOGLE_CLIENT_SECRET=test-gizli MOLA_PUBLIC_URL=http://127.0.0.1:7899 MOLA_GOOGLE_AUTH_URL=http://127.0.0.1:7827/auth MOLA_GOOGLE_TOKEN_URL=http://127.0.0.1:7827/token MOLA_PREVIEW_ALLOW=127.0.0.1:7831 MOLA_SMTP_URL=smtp://127.0.0.1:7825 MOLA_MAIL_FROM="Mola <mola@ornek.test>" \
+            "./target/release/${{ matrix.binary }}" > "$RUNNER_TEMP/server.log" 2>&1 &
+          for _ in $(seq 1 50); do
+            curl -sf http://127.0.0.1:7899/api/health > /dev/null && break
+            sleep 0.2
+          done
+          MOLA_URL=http://127.0.0.1:7899 MOLA_BIN="$PWD/target/release/${{ matrix.binary }}" node server/tests/e2e.mjs
+
+      - name: Paketle
+        id: package
+        run: |
+          version=$(grep -m1 '^version' server/Cargo.toml | cut -d'"' -f2)
+          name="mola-server-$version-${{ matrix.suffix }}"
+          mkdir "$name"
+          cp "target/release/${{ matrix.binary }}" server/KULLANIM.txt "$name/"
+          cp -r desktop/dist "$name/web"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+            echo "file=$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            echo "file=$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.package.outputs.file }}
+          path: ${{ steps.package.outputs.file }}
+
+      - name: Sürüme yükle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "${{ steps.package.outputs.file }}" --clobber
+
+  publish:
+    name: Sürümü yayımla
+    needs: [create-release, desktop, server]
+    # Yalnızca bütün platformlar başarılıysa: yarım bir sürüm yayımlanmaz.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sağlamaları üret ve yayımla
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir assets
+          gh release download "$TAG" --dir assets
+          (cd assets && rm -f SHA256SUMS.txt && sha256sum -- * > ../SHA256SUMS.txt)
+          cat SHA256SUMS.txt
+          gh release upload "$TAG" SHA256SUMS.txt --clobber
+          gh release edit "$TAG" --draft=false
