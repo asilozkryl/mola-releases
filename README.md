@@ -18,4 +18,9 @@ Paketler imzasızdır. Windows SmartScreen "bilinmeyen yayıncı" uyarısı veri
 çalıştır"); macOS'ta ilk açılışta uygulamaya sağ tıklayıp "Aç" demek gerekir. Dosya sağlamaları her
 sürümdeki `SHA256SUMS.txt` içindedir.
 
-Masaüstü uygulaması yeni sürüm olup olmadığına bu depodan bakar.
+Masaüstü uygulaması yeni sürüm olup olmadığına bu depodan bakar. 1.5.0'dan itibaren kendini de buradan
+günceller: yeni sürüm çıkınca köşedeki nottan "Güncelle ve yeniden başlat" demek yeterlidir. 1.4.2 ve
+öncesini kullananlar 1.5.0'ı (ya da sonrasını) bir kez elle kurmalıdır.
+
+Sürümlerdeki `.sig` dosyaları ve `latest.json` uygulamanın kendini güncellemesi içindir: `.sig`
+paketin imzası, `latest.json` güncelleme bildirimidir. Elle indirmen gerekmez.

@@ -111,13 +111,30 @@ jobs:
         working-directory: desktop
         run: pnpm install --frozen-lockfile
 
+      # Uygulama kendini güncelleyebilsin diye paketler imzalanır (yanlarına .sig dosyası çıkar).
+      # Bunu açan ayar dosyası 1.5.0 ile geldi; daha eski bir etiket derlenirse imzasız derlenir.
+      - name: Güncelleme imzaları
+        id: updater
+        shell: bash
+        run: |
+          if [ -f desktop/src-tauri/tauri.release.conf.json ]; then
+            echo "args=--config src-tauri/tauri.release.conf.json" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # İmza anahtarı parolasızdır. Açık anahtar uygulamanın tauri.conf.json dosyasında durur;
+          # bu sır kaybolursa ya da değişirse kurulu uygulamalar yeni sürümleri reddeder.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         with:
           projectPath: desktop
+          args: ${{ steps.updater.outputs.args }}
           # Paketler bu depodaki taslak sürüme yüklenir.
           releaseId: ${{ needs.create-release.outputs.release_id }}
+          # Güncelleme bildirimi (latest.json) yayımlama adımında, bütün platformlar bittikten sonra
+          # tek seferde üretilir; platformlar aynı dosyayı ayrı ayrı güncellemeye çalışmaz.
           uploadUpdaterJson: false
           uploadWorkflowArtifacts: true
 
@@ -218,13 +235,56 @@ jobs:
     # Yalnızca bütün platformlar başarılıysa: yarım bir sürüm yayımlanmaz.
     runs-on: ubuntu-latest
     steps:
-      - name: Sağlamaları üret ve yayımla
+      - name: Güncelleme bildirimini ve sağlamaları üret, yayımla
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir assets
           gh release download "$TAG" --dir assets
-          (cd assets && rm -f SHA256SUMS.txt && sha256sum -- * > ../SHA256SUMS.txt)
+          rm -f assets/SHA256SUMS.txt assets/latest.json
+
+          # Güncelleme bildirimi: kurulu uygulamalar "en son sürüm"ün latest.json dosyasına bakar,
+          # kendi paket türünün satırındaki dosyayı indirir ve imzasını doğrular. Satırlar imzası
+          # (.sig) olan paketlerden üretilir; adresler sürüm yayımlanınca geçerli olur.
+          # Uygulama önce "işletim sistemi-mimari-paket türü" anahtarına, yoksa türsüz olana bakar.
+          # Windows ve Linux'ta türsüz anahtar bilerek yazılmaz: .deb kurulumu AppImage dosyasını
+          # indirip kurmaya çalışmasın. Satırı olmayan paket türü güncellenmez, yalnızca haber alır.
+          base="https://github.com/$GH_REPO/releases/download/$TAG"
+          for sig in assets/*.sig; do
+            [ -e "$sig" ] || continue
+            file=$(basename "${sig%.sig}")
+            case "$file" in
+              *_aarch64.app.tar.gz) keys="darwin-aarch64-app darwin-aarch64" ;;
+              *-setup.exe) keys="windows-x86_64-nsis" ;;
+              *.msi) keys="windows-x86_64-msi" ;;
+              *.AppImage) keys="linux-x86_64-appimage" ;;
+              *.deb) keys="linux-x86_64-deb" ;;
+              *.rpm) keys="linux-x86_64-rpm" ;;
+              *) echo "::warning::İmzası olan ama tanınmayan paket: $file"; continue ;;
+            esac
+            for key in $keys; do
+              jq -n --arg key "$key" --arg signature "$(cat "$sig")" --arg url "$base/$file" \
+                '{($key): {signature: $signature, url: $url}}'
+            done
+          done | jq -s --arg version "${TAG#v}" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{version: $version, pub_date: $date, platforms: (add // {})}' > latest.json
+          jq '{version, platforms: (.platforms | keys)}' latest.json
+          # İmzalı sürümde bir işletim sistemi eksik kalırsa oradaki uygulamalar güncellenemez:
+          # eksik sürüm yayımlanmaz, taslak kalır. Diğer paket türleri eksikse yalnızca uyarılır.
+          if [ "$(jq '.platforms | length' latest.json)" -gt 0 ]; then
+            for key in darwin-aarch64 windows-x86_64-nsis linux-x86_64-appimage; do
+              jq -e --arg key "$key" '.platforms[$key]' latest.json > /dev/null ||
+                { echo "::error::latest.json içinde $key yok; imza dosyası üretilmemiş."; exit 1; }
+            done
+            for key in windows-x86_64-msi linux-x86_64-deb linux-x86_64-rpm; do
+              jq -e --arg key "$key" '.platforms[$key]' latest.json > /dev/null ||
+                echo "::warning::latest.json içinde $key yok; bu paket türü kendini güncelleyemez, yalnızca haber verir."
+            done
+            gh release upload "$TAG" latest.json --clobber
+          fi
+
+          # Sağlamalar kullanıcının indirdiği paketler içindir; imza dosyaları listeye girmez.
+          (cd assets && rm -f -- *.sig && sha256sum -- * > ../SHA256SUMS.txt)
           cat SHA256SUMS.txt
           gh release upload "$TAG" SHA256SUMS.txt --clobber
           gh release edit "$TAG" --draft=false
